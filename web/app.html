@@ -617,6 +617,20 @@ table.master td.cell { height: 34px; padding: 2px 1px; }
 .check-row { display: flex; align-items: center; gap: 7px; font-size: 12.5px; padding: 6px 0; }
 .check-row input { width: 15px; height: 15px; accent-color: var(--brand); }
 
+/* 批量导出：多选清单 */
+.batch-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.batch-bar .inp { width: 210px; }
+.batch-pick {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 12px;
+  max-height: 326px; overflow: auto; padding: 8px 12px;
+  border: 1px solid var(--line-2); border-radius: 10px; background: #fcfdff;
+}
+.batch-pick .check-row { padding: 5px 0; margin: 0; }
+.batch-pick .check-row.off { display: none; }
+.batch-pick .check-row b { font-weight: 600; }
+.batch-pick .check-row small { color: var(--ink-3); font-size: 11px; }
+.batch-pick .empty { grid-column: 1 / -1; padding: 18px 0; text-align: center; color: var(--ink-3); font-size: 12px; }
+
 .ban-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; }
 .ban-cell {
   height: 26px; border-radius: 6px; border: 1px solid var(--line-2); background: #fff;
@@ -1149,8 +1163,8 @@ function normSlotPeriods(state) {
    - 升级旧数据时按班级名补齐默认副班主任，用户后续修改（含清空）不再被覆盖
    ========================================================= */
 const DEFAULT_VICE_HEADS = {
-  '七1': 'T15', '七2': 'T11', '七3': 'T07',
-  '八1': 'T22', '八2': 'T21', '八3': 'T29'
+  '七1': '陈彦均', '七2': '陆湘杰', '七3': '李杨',
+  '八1': '陆大双', '八2': '徐梦倩', '八3': '蔡冰洁'
 };
 const CN_DIGITS = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
 
@@ -1280,11 +1294,28 @@ function normSeating(state) {
 }
 
 /** 为旧数据补齐新字段（正副班主任 / 组长设置 / 监考安排 / 考场编排）；返回是否发生了修改 */
+/** 长期调整记录：缺字段时补齐；指向已删课程的记录一并清掉 */
+function normPerms(state) {
+  let changed = false;
+  if (!Array.isArray(state.perms)) { state.perms = []; return true; }
+  const ids = {};
+  (state.lessons || []).forEach((l) => { ids[l.id] = 1; });
+  const keep = state.perms.filter((x) => x && x.id && x.lessonId && ids[x.lessonId]);
+  if (keep.length !== state.perms.length) { state.perms = keep; changed = true; }
+  state.perms.forEach((x) => {
+    if (x.type !== 'teacher' && x.type !== 'time') { x.type = 'time'; changed = true; }
+    if (!Array.isArray(x.classIds)) { x.classIds = []; changed = true; }
+    if (!x.at) { x.at = Date.now(); changed = true; }
+  });
+  return changed;
+}
+
 function normalizeState(state) {
   if (!state) return false;
-  // 注意：三个归一化都要执行，不能用 || 短路
+  // 注意：各个归一化都要执行，不能用 || 短路
   const cExam = normExam(state), cSeat = normSeating(state), cSlot = normSlotPeriods(state);
-  let changed = cExam || cSeat || cSlot;
+  const cPerm = normPerms(state);
+  let changed = cExam || cSeat || cSlot || cPerm;
   if (!state.groupLeaders || typeof state.groupLeaders !== 'object') {
     state.groupLeaders = { prep: {}, subject: {} };
     changed = true;
@@ -1894,10 +1925,15 @@ function removeLesson(id) {
   DB.save();
 }
 
-function moveLesson(id, day, slot) {
+/** 长期改固定时段；opts.record === false 时不留长期调整记录（自动排课等批量动作用） */
+function moveLesson(id, day, slot, opts) {
   const l = lessonOf(id);
   if (!l) return;
+  const from = { day: l.day, slot: l.slot };
   l.day = day; l.slot = slot;
+  if (!opts || opts.record !== false) {
+    recordPermTime(l, from, { day: day, slot: slot }, (opts && opts.reason) || '长期调整时间');
+  }
   DB.save();
 }
 
@@ -1944,6 +1980,55 @@ function removeAdjustment(id) {
   const a = DB.S.adjustments.find((x) => x.id === id);
   if (a) { a.status = 'revoked'; a.revokedAt = Date.now(); }
   DB.save();
+}
+
+/* =========================================================
+   长期调整记录（整学期生效：换任课教师 / 改固定时段）
+   只为「长期调课通知」留痕，不参与课表计算；
+   临时调课（adjustments）按周生效，两者互不替代。
+   ========================================================= */
+function permList() {
+  if (!DB.S.perms) DB.S.perms = [];
+  return DB.S.perms;
+}
+function permOf(id) {
+  return permList().find((x) => x.id === id) || null;
+}
+function addPerm(rec) {
+  const it = Object.assign({ id: uid('pm'), at: Date.now() }, rec);
+  permList().push(it);
+  DB.save();
+  return it;
+}
+function removePerm(id) {
+  DB.S.perms = permList().filter((x) => x.id !== id);
+  DB.save();
+}
+function clearPerms() {
+  DB.S.perms = [];
+  DB.save();
+}
+/** 记录快照：即使之后课程被删除，通知里仍能写出课程名与班级 */
+function permBase(l, reason) {
+  const subj = subjectOf(l.subjectId) || {};
+  return {
+    lessonId: l.id,
+    subjectId: l.subjectId,
+    subjectName: subj.name || '',
+    classIds: l.classIds.slice(),
+    className: classLabel(className(l.classIds)),
+    reason: reason || ''
+  };
+}
+/** 记录一次长期改时段（时段没变则不记） */
+function recordPermTime(l, from, to, reason) {
+  if (!l || !from || !to) return null;
+  if (from.day === to.day && from.slot === to.slot) return null;
+  return addPerm(Object.assign(permBase(l, reason || '长期调整时间'), {
+    type: 'time',
+    fromDay: from.day, fromSlot: from.slot,
+    toDay: to.day, toSlot: to.slot
+  }));
 }
 
 /* =========================================================
@@ -2346,6 +2431,33 @@ function xlSpecToSheet(spec) {
   };
 }
 
+/** 合并单元格地址随块下移：A1:F1 → A21:F21 */
+function xlShiftRef(ref, off) {
+  return String(ref).replace(/([A-Z]+)(\d+)/g, (m, c, r) => c + (+r + off));
+}
+
+/** 多张课表纵向拼进同一张工作表：块与块之间留一行空白并插入分页符，
+    打印 / 转 PDF 时每张课表各占一页（列宽行高一致，因为同一周、同一套节次设置） */
+function xlStackSheets(specs, sheetName) {
+  const sheets = (specs || []).map((sp) => xlSpecToSheet(sp)).filter(Boolean);
+  if (!sheets.length) return null;
+  const nCols = sheets[0].cols.length;
+  const rows = [];
+  const merges = [];
+  const breaks = [];
+  sheets.forEach((sh, i) => {
+    const off = rows.length;
+    sh.rows.forEach((r) => rows.push(r));
+    sh.merges.forEach((m) => merges.push(off ? xlShiftRef(m, off) : m));
+    if (i < sheets.length - 1) {
+      // 收尾留一行窄空白，分页符挂在这一行上，任何 Excel / WPS 解释下都不会把课表行切开
+      rows.push({ ht: 10, cells: Array.from({ length: nCols }, () => ({ v: '', s: 1 })) });
+      breaks.push(rows.length);
+    }
+  });
+  return { name: sheetName || '课程表', cols: sheets[0].cols.slice(), rows: rows, merges: merges, breaks: breaks };
+}
+
 const Export = {
   xml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
@@ -2436,7 +2548,13 @@ const Export = {
           sh.merges.map((m) => '<mergeCell ref="' + m + '"/>').join('') + '</mergeCells>';
       }
       x += '<pageMargins left="0.3" right="0.3" top="0.4" bottom="0.4" header="0.2" footer="0.2"/>' +
-        '<pageSetup paperSize="9" orientation="portrait" fitToWidth="1" fitToHeight="0"/></worksheet>';
+        '<pageSetup paperSize="9" orientation="portrait" fitToWidth="1" fitToHeight="0"/>';
+      // 手工分页符（批量导出：每张课表一页）。按 OOXML 顺序必须排在 pageSetup 之后
+      if (sh.breaks && sh.breaks.length) {
+        x += '<rowBreaks count="' + sh.breaks.length + '" manualBreakCount="' + sh.breaks.length + '">' +
+          sh.breaks.map((b) => '<brk id="' + b + '" max="16383" man="1"/>').join('') + '</rowBreaks>';
+      }
+      x += '</worksheet>';
       return x;
     };
 
@@ -2507,6 +2625,14 @@ const Export = {
 
   xlsxSpec(spec, filename) { this.xlsxSpecs([spec], filename); },
 
+  /** 批量课表 XLSX：所选课表拼进同一张工作表，每张之间分页，打印时一页一个对象 */
+  xlsxSpecsPaged(specs, filename, sheetName) {
+    const sh = xlStackSheets(specs, sheetName);
+    if (!sh) return false;
+    this.download(new Blob([this.buildWorkbook([sh])], { type: XL_MIME }), filename);
+    return true;
+  },
+
   print(title, subtitle, bodyHTML) {
     const root = document.getElementById('printRoot');
     root.innerHTML =
@@ -2550,7 +2676,18 @@ const Export = {
     p.push('<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">');
     p.push('<rect width="' + W + '" height="' + H + '" fill="#ffffff"/>');
     p.push('<text x="24" y="41" font-family="' + F + '" font-size="20" font-weight="700" fill="#141a26">' + this.xml(o.title) + '</text>');
-    if (o.subtitle) p.push('<text x="24" y="63" font-family="' + F + '" font-size="12" fill="#8d96a8">' + this.xml(o.subtitle) + '</text>');
+    // 表头类型徽标：临时调课 / 长期换教师 / 代课 …，紧跟其后的说明行右移让位
+    let subX = 24;
+    if (o.tag) {
+      const tagTxt = String(o.tag);
+      let tw0 = 0;
+      for (const ch of tagTxt) tw0 += /[\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef]/.test(ch) ? 10.5 : 6;
+      const tagW = Math.round(tw0 + 18);
+      p.push('<rect x="24" y="49" width="' + tagW + '" height="19" rx="9.5" fill="#eef3ff" stroke="#c9dbfa" stroke-width="1"/>');
+      p.push('<text x="' + X(24 + tagW / 2) + '" y="62.5" text-anchor="middle" font-family="' + F + '" font-size="10.5" font-weight="700" fill="#2f57cc">' + this.xml(tagTxt) + '</text>');
+      subX = 24 + tagW + 10;
+    }
+    if (o.subtitle) p.push('<text x="' + subX + '" y="62.5" font-family="' + F + '" font-size="12" fill="#8d96a8">' + this.xml(o.subtitle) + '</text>');
     if (o.stamp) p.push('<text x="' + (W - 24) + '" y="41" text-anchor="end" font-family="' + F + '" font-size="11" fill="#b6becd">' + this.xml(o.stamp) + '</text>');
     p.push('<line x1="1" y1="' + (o.topPad - 12) + '" x2="' + (W - 1) + '" y2="' + (o.topPad - 12) + '" stroke="#e8ecf4" stroke-width="1"/>');
 
@@ -2559,9 +2696,21 @@ const Export = {
     p.push('<text x="' + (o.leftW / 2) + '" y="' + (hy + 28) + '" text-anchor="middle" font-family="' + F + '" font-size="10.5" fill="#9aa3b5">节次 / 星期</text>');
     o.dayLabels.forEach((d, i) => {
       const x = o.leftW + i * o.colW;
-      if (d.hot) p.push('<rect x="' + x + '" y="' + hy + '" width="' + o.colW + '" height="' + o.headH + '" fill="#edf3ff"/>');
-      p.push('<text x="' + (x + o.colW / 2) + '" y="' + (hy + 21) + '" text-anchor="middle" font-family="' + F + '" font-size="13" font-weight="600" fill="' + (d.hot ? '#2f57cc' : '#141a26') + '">' + this.xml(d.name) + '</text>');
-      if (d.date) p.push('<text x="' + (x + o.colW / 2) + '" y="' + (hy + 37) + '" text-anchor="middle" font-family="' + F + '" font-size="10" fill="' + (d.hot ? '#3b6cf6' : '#a9b1c2') + '">' + this.xml(d.date) + '</text>');
+      if (d.hot) {
+        p.push('<rect x="' + x + '" y="' + hy + '" width="' + o.colW + '" height="' + o.headH + '" fill="#eef4ff"/>');
+        p.push('<rect x="' + x + '" y="' + hy + '" width="' + o.colW + '" height="3" fill="#3b6cf6"/>');
+      }
+      p.push('<text x="' + (x + o.colW / 2) + '" y="' + (hy + 19) + '" text-anchor="middle" font-family="' + F + '" font-size="13" font-weight="600" fill="' + (d.hot ? '#2f57cc' : '#141a26') + '">' + this.xml(d.name) + '</text>');
+      if (d.date) {
+        if (d.hot) {
+          // 涉及调整的日期：实心胶囊反白，远看即可定位
+          const dw = Math.max(48, String(d.date).length * 7.2 + 16);
+          p.push('<rect x="' + X(x + o.colW / 2 - dw / 2) + '" y="' + (hy + 25) + '" width="' + X(dw) + '" height="17" rx="8.5" fill="#3b6cf6"/>');
+          p.push('<text x="' + X(x + o.colW / 2) + '" y="' + (hy + 37) + '" text-anchor="middle" font-family="' + F + '" font-size="10.5" font-weight="700" fill="#ffffff">' + this.xml(d.date) + '</text>');
+        } else {
+          p.push('<text x="' + (x + o.colW / 2) + '" y="' + (hy + 37) + '" text-anchor="middle" font-family="' + F + '" font-size="10" fill="#a9b1c2">' + this.xml(d.date) + '</text>');
+        }
+      }
     });
 
     o.slotDefs.forEach((s2, r) => {
@@ -2742,7 +2891,7 @@ const Export = {
     return { svg: p.join(''), width: W, height: H, courseSize: courseSize, teacherSize: teacherSize };
   },
 
-  /** 多张课表纵向拼接（批量导出 / 全校总课表） */
+  /** 多张课表纵向拼接（批量导出） */
   sheetSVGMulti(specs) {
     const parts = specs.map((s) => this.sheetSVG(s));
     const W = Math.max.apply(null, parts.map((x) => x.width));
@@ -3434,9 +3583,8 @@ function viewClassTT() {
     '<div class="field"><label>班级</label>' + classSelectHTML('class', cid) + '</div>' +
     '<span class="spacer"></span>' +
     '<button class="btn" data-act="week-prev">上一周</button><button class="btn" data-act="week-next">下一周</button>' +
-    '<button class="btn" data-act="exp-png" data-target="class">' + icon('img') + '导出图片</button>' +
-    '<button class="btn" data-act="exp-xlsx" data-target="class">' + icon('sheet') + 'Excel</button>' +
-    '<button class="btn" data-act="exp-print" data-target="class">' + icon('print') + '打印</button>' +
+    '<button class="btn" data-act="exp-xlsx" data-target="class">' + icon('sheet') + '导出 Excel</button>' +
+    '<button class="btn primary" data-act="tt-batch" data-kind="class" title="勾选多个班级，一次导出各自课表（每页一个班）">' + icon('sheet') + '批量导出</button>' +
     stashToggleHTML();
 
   let h = '<div class="toolbar">' + acts + '</div>';
@@ -3470,9 +3618,8 @@ function viewTeacherTT() {
   const acts = '<div class="field"><label>周次</label>' + weekSelectHTML('week', UI.week) + '</div>' +
     '<div class="field"><label>教师</label>' + teacherSelectHTML('teacher', tid) + '</div>' +
     '<span class="spacer"></span>' +
-    '<button class="btn" data-act="exp-png" data-target="teacher">' + icon('img') + '导出图片</button>' +
-    '<button class="btn" data-act="exp-xlsx" data-target="teacher">' + icon('sheet') + 'Excel</button>' +
-    '<button class="btn" data-act="exp-print" data-target="teacher">' + icon('print') + '打印</button>' +
+    '<button class="btn" data-act="exp-xlsx" data-target="teacher">' + icon('sheet') + '导出 Excel</button>' +
+    '<button class="btn primary" data-act="tt-batch" data-kind="teacher" title="勾选多位教师，一次导出各自课表（每页一位老师）">' + icon('sheet') + '批量导出</button>' +
     stashToggleHTML();
 
   let h = '<div class="toolbar">' + acts + '</div>';
@@ -3520,7 +3667,8 @@ function viewTeacherTT() {
    ========================================================= */
 /* 全校总课表：纯文字表格
    整周视图 = 节次 × 星期；单日视图 = 节次 × 班级
-   不画色块，只用字号与层级区分课程 / 教师 / 场地，便于打印与快速扫读 */
+   不画色块，只用字号与层级区分课程 / 教师 / 场地，便于快速扫读
+   本页只做「看」：不提供导出图片 / Excel / 打印，也没有暂存区 */
 function mtBadge(weeks) {
   const b = parityLabel(weeks);
   if (!b) return '';
@@ -3664,12 +3812,6 @@ function viewMasterTT() {
       '</div></div>';
   }
 
-  acts += '<span class="spacer"></span>' +
-    '<button class="btn" data-act="exp-png" data-target="master" title="导出彩色课表简图 PNG（与上方文字表格版式不同）">' + icon('img') + '导出图片</button>' +
-    '<button class="btn" data-act="exp-xlsx" data-target="master">' + icon('sheet') + '全表 Excel</button>' +
-    '<button class="btn" data-act="exp-print" data-target="master">' + icon('print') + '打印</button>' +
-    stashToggleHTML();
-
   let main = '';
   if (!S.classes.length) {
     main += '<div class="empty-state"><div class="big">还没有班级</div><div class="tiny">先到「基础数据」添加班级与教学任务。</div></div>';
@@ -3688,7 +3830,7 @@ function viewMasterTT() {
     ? DAY_FULL[dayIdx] + ' ' + md(dates[dayIdx]) + ' · 第 ' + week + ' 周'
     : '第 ' + week + ' 周 · ' + weekRangeText(week) + ' · 整周';
 
-  return { title: '全校总课表', sub: sub, html: '<div class="toolbar">' + acts + '</div>' + ttLayoutHTML(main, stashPanelHTML({ mode: 'perm', week: week }), UI.stashOpen) };
+  return { title: '全校总课表', sub: sub, html: '<div class="toolbar">' + acts + '</div><div class="tt-main">' + main + '</div>' };
 }
 
 /* =========================================================
@@ -3709,6 +3851,7 @@ function viewAdjust() {
   const adjs = S.adjustments.filter((a) => a.status === 'active' &&
     (a.week === week || (a.type === 'cross' && a.toWeek === week))).slice().reverse();
   const panelOpen = UI.adjPanel === true;
+  const permCnt = (S.perms || []).length;
   const railOpen = panelOpen || UI.stashOpen;
 
   let h = '<div class="toolbar">' +
@@ -3723,7 +3866,9 @@ function viewAdjust() {
     stashToggleHTML() +
     '<button class="btn" data-act="adj-toggle">' + icon('swap') + (panelOpen ? '收起调课单' : '本周调课单') +
     (!panelOpen && adjs.length ? '<span class="pill warn" style="margin-left:5px">' + adjs.length + '</span>' : '') + '</button>' +
-    '<button class="btn primary" data-act="adj-notice">' + icon('bell') + '生成调课通知</button>' +
+    '<button class="btn primary" data-act="adj-notice">' + icon('bell') + '临时调课通知</button>' +
+    '<button class="btn" data-act="perm-notice" title="长期（整学期）换教师 / 改时段的调整通知">' + icon('bell') + '长期调课通知' +
+    (permCnt ? '<span class="pill warn" style="margin-left:5px">' + permCnt + '</span>' : '') + '</button>' +
     '<button class="btn" data-act="adj-print">' + icon('print') + '打印本周</button></div>';
 
   let main = '<div class="hint-bar">' + icon('swap') +
@@ -3858,6 +4003,110 @@ function classDutyLabels(teacherName) {
  * 汇总一周（或单条）调课，生成按接收人分组的通知文本
  * 返回 { blocks:[{name, role, text}], count, recips, missing, range }
  */
+/* ---------------------------------------------------------
+   通知接收人收集器：同一人合并成一份（任课教师条目 + 班主任条目）；
+   班级侧只生成一份给正班主任，未设正班主任的班记进 missing 并跳过。
+   临时调课（buildNotices）与长期调整（buildPermNotices）共用。
+   --------------------------------------------------------- */
+function noticeBag() {
+  const people = new Map();
+  const missing = new Set();
+  const push = (name, kind, item, extra) => {
+    if (!name) return;
+    let p = people.get(name);
+    if (!p) {
+      p = { name, teacher: [], relieved: [], head: [], headClasses: new Set(),
+        isHead: false, tid: null, classIds: [] };
+      people.set(name, p);
+    }
+    p[kind].push(item);
+    if (extra && extra.cls) { p.headClasses.add(extra.cls); p.isHead = true; }
+    if (extra && extra.tid) p.tid = extra.tid;
+    if (extra && extra.cid && p.classIds.indexOf(extra.cid) < 0) p.classIds.push(extra.cid);
+  };
+
+  /** 班级调整只生成一份通知给正班主任；未设正班主任时记录提示并跳过该班（不再发副班主任） */
+  const notifyClass = (c, item) => {
+    if (!c) return;
+    const label = classLabel(c.name);
+    if (!c.head) { missing.add(label); return; }
+    push(c.head, 'head', item, { cls: label, cid: c.id });
+  };
+
+  return { people: people, missing: missing, push: push, notifyClass: notifyClass };
+}
+
+/* 接收人集合 → 文字通知块 + 课表图片清单；tone 只改措辞，不改结构 */
+function noticeBlocks(bag, tone) {
+  const t = tone || {};
+  const blocks = [];
+  const images = [];
+
+  bag.people.forEach((p) => {
+    const lines = [t.docHead || '', ''];
+    const hasTeach = p.teacher.length > 0;
+    const hasRel = p.relieved.length > 0;
+    const classRole = '班主任';
+    const role = (hasTeach || hasRel) && p.head.length ? '任课教师 · ' + classRole
+      : (hasTeach || hasRel) ? '任课教师' : classRole;
+
+    if (hasTeach || hasRel) {
+      lines.push('致：' + p.name + ' 老师');
+      lines.push(t.teachIntro || '您本周的课程有以下调整：');
+      let n = 0;
+      p.teacher.concat(p.relieved).forEach((it) => {
+        n += 1;
+        lines.push('');
+        lines.push(n + '. ' + it.title);
+        lines.push('   ' + it.l1 + '：' + it.from);
+        lines.push('   ' + it.l2 + '：' + it.to);
+      });
+      lines.push('');
+      if (hasRel && !hasTeach) {
+        lines.push(t.relOnly || '以上课程已安排其他老师代课，您本节无需到班。');
+      } else if (hasRel) {
+        lines.push(t.relMixed || '其中代课安排已通知相关老师，其余课程请按调整后的时间上课。');
+      } else {
+        lines.push(t.teachTail || '请按调整后的时间上课，如有疑问请联系教务处。');
+      }
+      if (p.tid) images.push({ name: p.name, role: '任课教师', kind: 'teacher', id: p.tid });
+    }
+
+    if (p.head.length) {
+      if (hasTeach || hasRel) {
+        lines.push('');
+        lines.push('────────────────────');
+        lines.push('');
+      }
+      const duty = [];
+      if (p.headClasses.size) duty.push(Array.from(p.headClasses).join('、') + ' 班主任');
+      lines.push('致：' + p.name + ' 老师' + (duty.length ? '（' + duty.join('；') + '）' : ''));
+      lines.push(t.classIntro || '您班级本周课表有以下调整，请转告学生：');
+      p.head.forEach((it, i) => {
+        lines.push('');
+        lines.push((i + 1) + '. ' + it.title);
+        lines.push('   ' + (it.l1 || '原时间') + '：' + it.from);
+        lines.push('   ' + (it.l2 || '现时间') + '：' + it.to);
+        if (it.extra) lines.push('   ' + it.extra);
+      });
+      lines.push('');
+      lines.push(t.classTail || '请留意班级课表变化，谢谢配合。');
+      p.classIds.forEach((cid) => {
+        const c = classOf(cid);
+        if (c) images.push({
+          name: p.name,
+          role: '班主任',
+          kind: 'class', id: cid, label: classLabel(c.name)
+        });
+      });
+    }
+
+    blocks.push({ name: p.name, role: role, text: lines.join('\n') });
+  });
+
+  return { blocks: blocks, images: images };
+}
+
 function buildNotices(week, onlyAdjId) {
   const S = DB.S;
   const meta = S.meta;
@@ -3869,33 +4118,9 @@ function buildNotices(week, onlyAdjId) {
   const tShort = (d, s) => DAY_SHORT[d] + ' ' + (dates[d] ? md(dates[d]) : '') + ' ' + slotName(s);
   const tFull = (d, s) => tShort(d, s) + ' ' + (slotDef(s).start || '') + '-' + (slotDef(s).end || '');
 
-  const people = new Map();
-  const missing = new Set();
-  const push = (name, kind, item, extra) => {
-    if (!name) return;
-    let p = people.get(name);
-    if (!p) {
-      p = { name, teacher: [], relieved: [], head: [], headClasses: new Set(), viceClasses: new Set(),
-        isHead: false, isVice: false, tid: null, classIds: [] };
-      people.set(name, p);
-    }
-    p[kind].push(item);
-    if (extra && extra.cls) {
-      if (extra.vice) { p.viceClasses.add(extra.cls); p.isVice = true; }
-      else { p.headClasses.add(extra.cls); p.isHead = true; }
-    }
-    if (extra && extra.tid) p.tid = extra.tid;
-    if (extra && extra.cid && p.classIds.indexOf(extra.cid) < 0) p.classIds.push(extra.cid);
-  };
-
-  /** 班级调整同时通知正班主任与副班主任；正班主任缺失时仅记录提示，不阻断副班主任 */
-  const notifyClass = (c, item) => {
-    if (!c) return;
-    const label = classLabel(c.name);
-    if (!c.head) missing.add(label);
-    if (c.head) push(c.head, 'head', item, { cls: label, cid: c.id });
-    if (c.vice) push(c.vice, 'head', item, { cls: label, cid: c.id, vice: true });
-  };
+  const bag = noticeBag();
+  const push = bag.push;
+  const notifyClass = bag.notifyClass;
 
   adjs.forEach((a) => {
     const l = lessonOf(a.lessonId);
@@ -3955,88 +4180,202 @@ function buildNotices(week, onlyAdjId) {
     }
   });
 
-  const docHead = '【调课通知】' + (meta.school || '') + ' · 第 ' + week + ' 周（' + range + '）';
-  const blocks = [];
-  const images = [];
+  const types = { move: 0, sub: 0, cancel: 0, cross: 0 };
+  adjs.forEach((a) => { if (types[a.type] != null) types[a.type] += 1; });
+  const days = affectedDayList(adjs, week);
+  const dayTxt = days.length ? '　涉及日期：' + days.map((d) => d.text).join('、') : '';
 
-  people.forEach((p) => {
-    const lines = [docHead, ''];
-    const hasTeach = p.teacher.length > 0;
-    const hasRel = p.relieved.length > 0;
-    const classRole = p.isHead && p.isVice ? '班主任 / 副班主任'
-      : p.isVice ? '副班主任' : '班主任';
-    const role = (hasTeach || hasRel) && p.head.length ? '任课教师 · ' + classRole
-      : (hasTeach || hasRel) ? '任课教师' : classRole;
-
-    if (hasTeach || hasRel) {
-      lines.push('致：' + p.name + ' 老师');
-      lines.push('您本周的课程有以下调整：');
-      let n = 0;
-      p.teacher.concat(p.relieved).forEach((it) => {
-        n += 1;
-        lines.push('');
-        lines.push(n + '. ' + it.title);
-        lines.push('   ' + it.l1 + '：' + it.from);
-        lines.push('   ' + it.l2 + '：' + it.to);
-      });
-      lines.push('');
-      if (hasRel && !hasTeach) {
-        lines.push('以上课程已安排其他老师代课，您本节无需到班。');
-      } else if (hasRel) {
-        lines.push('其中代课安排已通知相关老师，其余课程请按调整后的时间上课。');
-      } else {
-        lines.push('请按调整后的时间上课，如有疑问请联系教务处。');
-      }
-      if (p.tid) images.push({ name: p.name, role: '任课教师', kind: 'teacher', id: p.tid });
-    }
-
-    if (p.head.length) {
-      if (hasTeach || hasRel) {
-        lines.push('');
-        lines.push('────────────────────');
-        lines.push('');
-      }
-      const duty = [];
-      if (p.headClasses.size) duty.push(Array.from(p.headClasses).join('、') + ' 班主任');
-      if (p.viceClasses.size) duty.push(Array.from(p.viceClasses).join('、') + ' 副班主任');
-      lines.push('致：' + p.name + ' 老师（' + duty.join('；') + '）');
-      lines.push('您班级本周课表有以下调整，请转告学生：');
-      p.head.forEach((it, i) => {
-        lines.push('');
-        lines.push((i + 1) + '. ' + it.title);
-        lines.push('   原时间：' + it.from);
-        lines.push('   现时间：' + it.to);
-      });
-      lines.push('');
-      lines.push('请留意班级课表变化，谢谢配合。');
-      p.classIds.forEach((cid) => {
-        const c = classOf(cid);
-        if (c) images.push({
-          name: p.name,
-          role: c.head === p.name ? '班主任' : (c.vice === p.name ? '副班主任' : '班主任'),
-          kind: 'class', id: cid, label: classLabel(c.name)
-        });
-      });
-    }
-
-    blocks.push({ name: p.name, role: role, text: lines.join('\n') });
+  const out = noticeBlocks(bag, {
+    docHead: '【临时调课通知】第 ' + week + ' 周（' + range + '）' + dayTxt
   });
-
-  return { blocks: blocks, images: images, count: adjs.length, recips: people.size, missing: Array.from(missing), range: range };
+  return {
+    blocks: out.blocks, images: out.images, count: adjs.length, recips: bag.people.size,
+    missing: Array.from(bag.missing), range: range, types: types, days: days
+  };
 }
 
-/* 生成某位接收人的「调课通知」图片配置：只保留涉及调整的课时格，其余行列裁掉 */
-function noticeImageOpts(kind, id, week, label) {
+/* ---------------------------------------------------------
+   长期调整通知：数据来自 state.perms（整学期换教师 / 改固定时段），
+   接收人与临时调课一致 —— 受影响的任课教师 + 班级正班主任（每班一份）。
+   --------------------------------------------------------- */
+function permSlotText(d, s) {
+  return DAY_SHORT[d] + ' ' + slotName(s);
+}
+
+function buildPermNotices() {
   const S = DB.S;
   const meta = S.meta;
+  const perms = permList().filter((x) => lessonOf(x.lessonId)).sort((a, b) => (a.at || 0) - (b.at || 0));
+  const bag = noticeBag();
+  const marks = { byLesson: {}, from: [] };
+
+  // 已被「换教师」覆盖的课，不再单独写一条改时段（时间已在那条里列出）
+  const teacherLessons = {};
+  perms.forEach((pm) => { if (pm.type === 'teacher') teacherLessons[pm.lessonId] = 1; });
+
+  // 同一「班级 + 学科 + 原任课 → 现任课」的多节课合并成一条，避免通知里堆 9 行
+  const groups = new Map();
+  perms.forEach((pm) => {
+    const l = lessonOf(pm.lessonId);
+    if (!l) return;
+    if (pm.type !== 'teacher' && teacherLessons[pm.lessonId]) return;
+    const subj = pm.subjectName || ((subjectOf(l.subjectId) || {}).name || '');
+    const clsName = pm.className || classLabel(className(l.classIds));
+    let key;
+    if (pm.type === 'teacher') {
+      key = ['t', clsName, subj, pm.fromTeacherId, pm.toTeacherId].join('|');
+    } else {
+      key = ['m', clsName, subj, pm.fromDay, pm.fromSlot, pm.toDay, pm.toSlot, l.teacherId].join('|');
+    }
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        type: pm.type === 'teacher' ? 'teacher' : 'time',
+        subj: subj, clsName: clsName, classIds: [], lessons: [], slots: [],
+        fromName: pm.fromTeacherName || '', toName: pm.toTeacherName || '',
+        fromId: pm.fromTeacherId || '', toId: pm.toTeacherId || '',
+        fromSlot: pm.fromSlot, toSlot: pm.toSlot, fromDay: pm.fromDay, toDay: pm.toDay,
+        teacherId: l.teacherId
+      };
+      groups.set(key, g);
+    }
+    g.lessons.push(l);
+    g.slots.push(permSlotText(l.day, l.slot));
+    l.classIds.forEach((cid) => { if (g.classIds.indexOf(cid) < 0) g.classIds.push(cid); });
+  });
+
+  groups.forEach((g) => {
+    const title = g.clsName + '《' + g.subj + '》';
+    g.lessons.sort((a, b) => a.day - b.day || a.slot - b.slot);
+    const slotTxt = g.lessons.map((l) => permSlotText(l.day, l.slot)).join('、');
+
+    if (g.type === 'teacher') {
+      bag.push(g.toName, 'teacher', {
+        title: title,
+        l1: '接任自', l2: '上课时间',
+        from: g.fromName || '—', to: slotTxt
+      }, { tid: g.toId });
+      bag.push(g.fromName, 'relieved', {
+        title: title,
+        l1: '上课时间', l2: '调整安排',
+        from: slotTxt, to: '本学期起改由 ' + (g.toName || '其他老师') + ' 任教'
+      }, { tid: g.fromId });
+      g.classIds.forEach((cid) => bag.notifyClass(classOf(cid), {
+        title: classLabel((classOf(cid) || {}).name || '') + '《' + g.subj + '》',
+        l1: '原任课教师', l2: '现任课教师',
+        from: g.fromName || '—', to: g.toName || '—',
+        extra: '上课时间：' + slotTxt
+      }));
+      g.lessons.forEach((l) => {
+        marks.byLesson[l.id] = { badge: '长', ring: '#0ea5e9', kind: 'teacher', sub2: '原任课：' + (g.fromName || '—') };
+      });
+      return;
+    }
+
+    const fromTxt = permSlotText(g.fromDay, g.fromSlot);
+    const toTxt = permSlotText(g.toDay, g.toSlot);
+    const tch = teacherOf(g.teacherId) || {};
+    bag.push(tch.name, 'teacher', {
+      title: title,
+      l1: '原时间', l2: '现时间',
+      from: fromTxt, to: toTxt
+    }, { tid: tch.id });
+    g.classIds.forEach((cid) => bag.notifyClass(classOf(cid), {
+      title: classLabel((classOf(cid) || {}).name || '') + '《' + g.subj + '》',
+      from: fromTxt, to: toTxt
+    }));
+    g.lessons.forEach((l) => {
+      marks.byLesson[l.id] = { badge: '长', ring: '#0ea5e9', kind: 'time', sub2: '原：' + fromTxt };
+    });
+    marks.from.push({
+      day: g.fromDay, slot: g.fromSlot, lessonId: g.lessons[0].id, subj: g.subj,
+      teacherId: tch.id, classIds: g.classIds.slice(), text: '已长期调至 ' + toTxt
+    });
+  });
+
+  const out = noticeBlocks(bag, {
+    docHead: '【长期调课通知】' + (meta.term || ''),
+    teachIntro: '您本学期以下课程的固定安排有长期调整：',
+    relOnly: '以上课程已全部移交其他老师，您本学期不再承担。',
+    relMixed: '其中部分课程已移交其他老师，其余课程请按调整后的安排上课。',
+    teachTail: '请按调整后的安排上课，如有疑问请联系教务处。',
+    classIntro: '贵班本学期以下课程的安排有长期调整，请转告学生：',
+    classTail: '以上调整整学期生效，请留意班级课表变化，谢谢配合。'
+  });
+
+  const nT = perms.filter((p) => p.type === 'teacher').length;
+  const nM = perms.length - nT;
+  const summary = [nT ? '换任课教师 ' + nT + ' 处' : '', nM ? '改固定时段 ' + nM + ' 处' : ''].filter(Boolean).join('、');
+
+  return {
+    blocks: out.blocks, images: out.images, marks: marks,
+    count: perms.length, recips: bag.people.size, missing: Array.from(bag.missing),
+    summary: summary
+  };
+}
+
+function buildPermNoticeDoc(res) {
+  const meta = DB.S.meta;
+  const line = '──────────────────────────────';
+  const head = [
+    '长 期 调 课 通 知',
+    (meta.term || ''),
+    '整学期生效｜共 ' + res.count + ' 处长期调整' + (res.summary ? '（' + res.summary + '）' : ''),
+    '需通知 ' + res.recips + ' 位老师',
+    '',
+    line
+  ].join('\n');
+  const tail = '\n\n' + line + '\n教务处　' + todayCN();
+  return head + '\n\n' + res.blocks.map((b) => b.text).join('\n\n' + line + '\n\n') + tail;
+}
+
+/* 调课类型标签：临时 / 长期 + 调课 / 代课，用于通知表头 */
+function noticeTypeTag(kinds) {
+  const k = kinds || {};
+  if (k.perm) {
+    if (k.permT && k.permM) return '长期调课 · 换教师';
+    if (k.permT) return '长期换教师';
+    return '长期调课';
+  }
+  const out = [];
+  if (k.move || k.cross) out.push('调课');
+  if (k.sub) out.push('代课');
+  if (!out.length && k.cancel) out.push('停课');
+  return '临时' + (out.length ? out.join(' · ') : '调整');
+}
+
+/** 调课实际落在哪几天（表头单独列一行，提高日期的可见度） */
+function affectedDayList(adjs, week) {
+  const dates = weekDates(week);
+  const set = {};
+  (adjs || []).forEach((a) => {
+    const l = lessonOf(a.lessonId);
+    if (l && l.day != null) set[l.day] = 1;
+    if ((a.type === 'move' || a.type === 'cross') && a.day != null) set[a.day] = 1;
+  });
+  return Object.keys(set).map(Number).sort((a, b) => a - b).map((d) => ({
+    day: d,
+    text: (dates[d] ? md(dates[d]) + ' ' : '') + (DAY_SHORT[d] || '')
+  }));
+}
+
+/* 生成某位接收人的「调课通知」图片配置：
+   课表固定画完整一周（五天 × 全部节次），只有涉及调整的格子才放课程卡片 */
+function noticeImageOpts(kind, id, week, label, marks) {
+  const S = DB.S;
+  const meta = S.meta;
+  const isPerm = !!marks;
   const ents = entriesForWeek(week);
   const adjs = S.adjustments.filter((a) => a.status === 'active' &&
     (a.week === week || (a.type === 'cross' && a.toWeek === week)));
   const adjByLesson = {};
   adjs.forEach((a) => { adjByLesson[a.lessonId] = a; });
+  // 长期调整的标记（badge / 描边色 / 副标题），优先于本周调课记录
+  const mk = (marks && marks.byLesson) || null;
   const mine = (e) => kind === 'teacher' ? e.teacherId === id : e.lesson.classIds.indexOf(id) > -1;
 
   const map = {};
+  const kinds = {};
   const put = (d, s, item) => { (map[d + '-' + s] = map[d + '-' + s] || []).push(item); };
   const has = (d, s) => !!map[d + '-' + s];
 
@@ -4047,8 +4386,9 @@ function noticeImageOpts(kind, id, week, label) {
   // 1) 调整后的课程（未涉及调整的一律不画）
   ents.filter(mine).forEach((e) => {
     const l = e.lesson;
-    const a = adjByLesson[l.id];
-    if (!a) return;
+    const mark = mk ? mk[l.id] : null;
+    const a = mark ? null : adjByLesson[l.id];
+    if (!a && !mark) return;
     const subj = subjectOf(l.subjectId) || {};
     const item = {
       title: subj.name || '',
@@ -4056,15 +4396,24 @@ function noticeImageOpts(kind, id, week, label) {
       sub2: '',
       color: subj.color || '#3b6cf6'
     };
-    if (a.type === 'move') {
+    if (mark) {
+      item.badge = mark.badge || '长';
+      item.ring = mark.ring || '#0ea5e9';
+      item.sub2 = mark.sub2 || '';
+      if (mark.kind === 'teacher') kinds.permT = 1; else kinds.permM = 1;
+      kinds.perm = 1;
+    } else if (a.type === 'move') {
+      kinds.move = 1;
       item.badge = '调';
       item.ring = '#d97706';
       item.sub2 = '原：' + DAY_SHORT[l.day] + ' ' + slotName(l.slot);
     } else if (a.type === 'sub') {
+      kinds.sub = 1;
       item.badge = '代';
       item.ring = '#2563eb';
       item.sub2 = '原：' + ((teacherOf(l.teacherId) || {}).name || '');
     } else if (a.type === 'cross') {
+      kinds.cross = 1;
       item.badge = '跨';
       item.ring = '#7c3aed';
       item.sub2 = '第 ' + a.week + ' 周调入';
@@ -4080,6 +4429,7 @@ function noticeImageOpts(kind, id, week, label) {
     const affects = kind === 'teacher' ? (l.teacherId === id) : (l.classIds.indexOf(id) > -1);
     if (!affects) return;
     const key = l.day + '-' + l.slot;
+    if (!mk || !mk[l.id]) kinds[a.type] = 1;
 
     if (a.type === 'sub') {
       if (kind === 'teacher' && l.teacherId === id && !has(l.day, l.slot)) {
@@ -4115,44 +4465,79 @@ function noticeImageOpts(kind, id, week, label) {
     }
   });
 
+  // 3) 长期调整：原时段留下的虚线标记（该格已空才画）
+  ((marks && marks.from) || []).forEach((f) => {
+    const mineFrom = kind === 'teacher' ? f.teacherId === id : (f.classIds || []).indexOf(id) > -1;
+    if (!mineFrom) return;
+    kinds.perm = 1; kinds.permM = 1;
+    if (has(f.day, f.slot)) return;
+    put(f.day, f.slot, {
+      title: f.subj || '', sub: f.text || '已长期调整', sub2: '',
+      color: '#94a3b8', badge: '长', ring: '#0ea5e9', dashed: true, dim: true
+    });
+  });
+
   const keys = Object.keys(map);
   if (!keys.length) return null;
 
-  // 只保留出现过的星期与节次
-  const days = Array.from(new Set(keys.map((k) => +k.split('-')[0]))).sort((a, b) => a - b);
-  const slots = Array.from(new Set(keys.map((k) => +k.split('-')[1]))).sort((a, b) => a - b);
   const dates = weekDates(week);
+  // 完整一周：所有上课日 + 全部节次（不因无调整而裁行裁列）
+  const nDays = Math.min(DAY_SHORT.length, meta.daysPerWeek || 5);
+  const days = [];
+  for (let d = 0; d < nDays; d++) days.push(d);
+  const slots = meta.slotDefs.map((x) => x.index).sort((a, b) => a - b);
   const allSlots = {};
   meta.slotDefs.forEach((x) => { allSlots[x.index] = x; });
 
+  // 有调整的日期在表头高亮（实心日期胶囊）
+  const hotDays = {};
+  keys.forEach((k) => { hotDays[+k.split('-')[0]] = 1; });
+
   const title = kind === 'teacher'
-    ? ((teacherOf(id) || {}).name || '') + ' 老师 · 调课通知'
-    : (label || classLabel((classOf(id) || {}).name)) + ' 调课通知';
+    ? ((teacherOf(id) || {}).name || '') + ' 老师 · ' + (isPerm ? '长期调整通知' : '调课通知')
+    : (label || classLabel((classOf(id) || {}).name)) + (isPerm ? ' 长期调整通知' : ' 调课通知');
 
   return {
     title: title,
-    subtitle: (meta.school || '') + ' · 第 ' + week + ' 周（' + shortDateRange(week) + '）· 仅显示涉及调整的课程',
-    stamp: '调课 ' + todayCN(),
-    dayLabels: days.map((d) => ({ name: DAY_SHORT[d], date: md(dates[d]) })),
+    tag: noticeTypeTag(kinds),
+    subtitle: isPerm
+      ? (meta.term || '') + ' · 整学期生效 · 第 ' + week + ' 周课表（' + shortDateRange(week) + '）'
+      : (meta.term || '') + ' · 第 ' + week + ' 周（' + shortDateRange(week) + '）',
+    stamp: (isPerm ? '长期调整 ' : '调课 ') + todayCN(),
+    dayLabels: days.map((d) => ({
+      name: DAY_SHORT[d],
+      date: dates[d] ? md(dates[d]) : '',
+      hot: !!hotDays[d]
+    })),
     slotDefs: slots.map((i) => allSlots[i]).filter(Boolean),
     getCell: (dIdx, slotIdx) => map[days[dIdx] + '-' + slotIdx] || [],
-    colW: days.length <= 2 ? 215 : days.length === 3 ? 185 : 158,
-    rowH: 84,
-    leftW: 88,
-    footer: '调 = 课程调整　代 = 代课　停 = 停课　跨 = 跨周调课　灰色虚线为原安排'
+    colW: 152,
+    rowH: 82,
+    leftW: 84,
+    headH: 48,
+    footer: '空白格为本周正常课表，此处只标注涉及调整的课程　调 = 调课　代 = 代课　停 = 停课　跨 = 跨周调课　灰色虚线为原安排'
   };
 }
 
 function buildNoticeDoc(res, week) {
   const meta = DB.S.meta;
   const line = '──────────────────────────────';
+  const tc = res.types || {};
+  const parts = [];
+  if (tc.move) parts.push('调课 ' + tc.move + ' 处');
+  if (tc.cross) parts.push('跨周调课 ' + tc.cross + ' 处');
+  if (tc.sub) parts.push('代课 ' + tc.sub + ' 处');
+  if (tc.cancel) parts.push('停课 ' + tc.cancel + ' 处');
+  const onlySub = tc.sub && !tc.move && !tc.cross && !tc.cancel;
   const head = [
-    '调 课 通 知',
-    (meta.school || '') + ' · ' + (meta.term || ''),
-    '第 ' + week + ' 周（' + res.range + '）｜共 ' + res.count + ' 处调整，需通知 ' + res.recips + ' 位老师',
+    onlySub ? '临 时 代 课 通 知' : '临 时 调 课 通 知',
+    (meta.term || ''),
+    '第 ' + week + ' 周（' + res.range + '）｜' + (parts.length ? parts.join('、') : '共 ' + res.count + ' 处调整'),
+    (res.days && res.days.length) ? '【涉及日期】' + res.days.map((d) => d.text).join('、') : null,
+    '需通知 ' + res.recips + ' 位老师',
     '',
     line
-  ].join('\n');
+  ].filter((x) => x != null).join('\n');
   const tail = '\n\n' + line + '\n教务处　' + todayCN();
   return head + '\n\n' + res.blocks.map((b) => b.text).join('\n\n' + line + '\n\n') + tail;
 }
@@ -4469,16 +4854,13 @@ function viewExport() {
     ] },
     { t: '教师课表', d: '按教师导出个人课表，版式与班级课表一致，可直接分发。', acts: [
       ['exp-all-teacher-png', '全部教师 PNG'], ['exp-all-teacher-xlsx', '全部教师 Excel'], ['exp-print-all-teacher', '批量打印']
-    ] },
-    { t: '全校总课表', d: '按班级分页导出，每页与单个班级课表同版式；整周/单日跟随当前视图。', acts: [
-      ['exp-png|master', '导出 PNG'], ['exp-xlsx|master', '导出 Excel'], ['exp-print|master', '打印']
     ] }
   ];
 
   let h = '<div class="toolbar"><div class="field"><label>导出周次</label>' + weekSelectHTML('week', UI.week) + '</div>' +
     '<div class="field"><label>学校名称（导出抬头）</label>' +
     '<input class="inp" data-change="exp-school" value="' + esc(DB.S.meta.school || '') + '" ' +
-    'placeholder="示例实验学校（演示数据）" style="width:288px"></div>' +
+    'placeholder="无锡狄邦文理学校（惠山校区）" style="width:288px"></div>' +
     '<span class="tiny muted">当前：第 ' + UI.week + ' 周 · ' + weekRangeText(UI.week) + '</span></div>';
 
   h += '<div class="exp-grid">';
@@ -6831,6 +7213,7 @@ function openLessonModal(lessonId) {
   footer += '<button class="btn" data-act="adj-cancel" data-id="' + l.id + '" title="仅影响第 ' + week + ' 周">本周停课</button>' +
     '<button class="btn" data-act="adj-sub" data-id="' + l.id + '" title="仅影响第 ' + week + ' 周">本周代课</button>' +
     '<button class="btn" data-act="cross-week" data-id="' + l.id + '" title="把这一周的课调到另一周">跨周调课</button>' +
+    '<button class="btn" data-act="perm-teacher" data-id="' + l.id + '" title="整学期更换任课教师">长期换教师</button>' +
     '<button class="btn primary" data-act="' + (longTerm ? 'perm-move' : 'adj-move') + '" data-id="' + l.id + '">' +
     (longTerm ? '长期调整时间' : '调整时间') + '</button>';
 
@@ -7125,6 +7508,101 @@ function openPermMove(lessonId) {
   });
 }
 
+/* ---------------- 长期更换任课教师（整学期生效） ---------------- */
+/** 把一节课的任课教师换成别人，并留一条长期调整记录（供导出长期调课通知） */
+function changeLessonTeacher(lessonId, teacherId, reason) {
+  const l = lessonOf(lessonId);
+  if (!l) return null;
+  const to = teacherOf(teacherId);
+  if (!to || !to.id || to.id === l.teacherId) return null;
+  const from = teacherOf(l.teacherId) || {};
+  l.teacherId = to.id;
+  return addPerm(Object.assign(permBase(l, reason), {
+    type: 'teacher',
+    fromTeacherId: from.id || '', fromTeacherName: from.name || '',
+    toTeacherId: to.id, toTeacherName: to.name
+  }));
+}
+
+function openPermTeacher(lessonId) {
+  const l = lessonOf(lessonId);
+  if (!l) return;
+  const subj = subjectOf(l.subjectId) || {};
+  const cur = teacherOf(l.teacherId) || {};
+  const mate = DB.S.lessons.filter((x) => x.id !== l.id && x.taskId && x.taskId === l.taskId);
+  const canAll = mate.length > 0;
+
+  let body = '<div class="detail-list">' +
+    '<div class="detail-line"><span class="k">课程</span><span class="v"><b>' + esc(subj.name || '') + '</b> · ' +
+    esc(className(l.classIds)) + '</span></div>' +
+    '<div class="detail-line"><span class="k">现任教师</span><span class="v">' + esc(cur.name || '—') + '</span></div>' +
+    '<div class="detail-line"><span class="k">固定时间</span><span class="v">' + DAY_FULL[l.day] + ' ' + slotName(l.slot) +
+    ' · ' + esc(weeksLabel(l.weeks)) + '</span></div></div>';
+
+  body += '<div class="form-row" style="margin-top:14px"><label>新任课教师</label><select class="sel" id="ptTeacher">' +
+    DB.S.teachers.filter((t) => t.id !== l.teacherId).map((t) =>
+      '<option value="' + t.id + '">' + esc(t.name) + '（' + esc((subjectOf(t.subjectId) || {}).name || '') + '）</option>').join('') +
+    '</select></div>';
+
+  if (canAll) {
+    body += '<div class="form-row"><label>调整范围</label><div style="display:flex;gap:6px">' +
+      '<button class="chip active" data-ptscope="one">仅本节课</button>' +
+      '<button class="chip" data-ptscope="all">该课程全部 ' + (mate.length + 1) + ' 节</button></div></div>';
+  }
+  body += '<div class="form-row"><label>调整原因</label><input class="inp" id="ptReason" placeholder="如：长期病假 / 岗位调整"></div>';
+  body += '<div id="ptPreview" style="margin-top:4px"></div>';
+
+  let scope = 'one';
+  const idsOf = () => (scope === 'all' && canAll ? [l.id].concat(mate.map((x) => x.id)) : [l.id]);
+
+  openModal({
+    title: '长期更换任课教师', width: 580,
+    sub: '整学期生效，同步到课程表与「临时调课」；改完可在「长期调整通知」里导出',
+    body: body,
+    footer: '<button class="btn" data-close>取消</button><button class="btn primary" id="ptSave">确认更换</button>',
+    onMount(r) {
+      const sel = r.querySelector('#ptTeacher'), prev = r.querySelector('#ptPreview');
+      const check = () => {
+        const cs = [];
+        idsOf().forEach((id) => {
+          const x = lessonOf(id);
+          if (!x) return;
+          conflictsFor({ day: x.day, slot: x.slot, weeks: x.weeks, teacherId: sel.value, classIds: x.classIds, room: x.room }, x.id)
+            .forEach((c) => cs.push(c));
+        });
+        prev.innerHTML = cs.length
+          ? '<div class="conflict-box"><b>' + cs.length + ' 处冲突：</b><div style="margin-top:5px">' +
+            cs.slice(0, 8).map((c) => '· ' + conflictText(c)).join('<br>') + '</div></div>'
+          : '<div class="conflict-box ok"><b>无冲突</b> — 新教师在这些时段均空闲</div>';
+      };
+      r.querySelectorAll('[data-ptscope]').forEach((btn) => {
+        btn.onclick = () => {
+          scope = btn.dataset.ptscope;
+          r.querySelectorAll('[data-ptscope]').forEach((x) => x.classList.toggle('active', x === btn));
+          check();
+        };
+      });
+      sel.onchange = check;
+      check();
+
+      r.querySelector('#ptSave').onclick = () => {
+        const reason = r.querySelector('#ptReason').value.trim() || '长期更换任课教师';
+        const ids = idsOf();
+        let n = 0;
+        ids.forEach((id) => { if (changeLessonTeacher(id, sel.value, reason)) n += 1; });
+        if (!n) { toast('新教师与现任相同，未做改动', 'warn'); return; }
+        if (scope === 'all' && canAll) {
+          const task = DB.S.tasks.find((t) => t.id === l.taskId);
+          if (task) task.teacherId = sel.value;
+        }
+        DB.save();
+        closeModal(); render();
+        toast('已长期更换 ' + n + ' 节课的任课教师，可在「长期调整通知」导出通知单', 'ok');
+      };
+    }
+  });
+}
+
 /* ---------------- 调课通知 ---------------- */
 function fallbackCopy(text, cb) {
   const ta = document.createElement('textarea');
@@ -7154,32 +7632,43 @@ function isClassRole(role) {
   return role === '班主任' || role === '副班主任';
 }
 
-function openNoticeModal(week, adjId) {
-  const res = buildNotices(week, adjId);
-  if (!res.blocks.length) { toast('本周还没有调课记录，无法生成通知', 'warn'); return; }
-  const doc = buildNoticeDoc(res, week);
+/* 通知弹窗通用外壳：课表图片 + 文字通知两个页签，支持复制 / 下载 txt / 下载全部图片。
+   临时调课（本周）与长期调整共用，差异只从 opt 传进来。 */
+function showNoticeModal(res, opt) {
+  const o = opt || {};
+  const week = o.week;
+  const marks = o.marks || null;
 
   // 为每位接收人生成课表图片
   const imgs = res.images.map((im) => {
-    const opts = noticeImageOpts(im.kind, im.id, week, im.label);
+    const opts = noticeImageOpts(im.kind, im.id, week, im.label, marks);
     if (!opts) return null;
     const built = Export.buildGridSVG(opts);
-    return { im: im, opts: opts, svg: built.svg, name: safeName(im.name + '-' + (im.label || '课表') + '-第' + week + '周') + '.png' };
+    return {
+      im: im, opts: opts, svg: built.svg,
+      name: safeName(im.name + '-' + (im.label || '课表') + '-' + (o.fileTag || ('第' + week + '周'))) + '.png'
+    };
   }).filter(Boolean);
 
   let body = '';
   if (res.missing.length) {
     body += '<div class="conflict-box" style="margin-bottom:12px"><b>提示：</b>' +
-      esc(res.missing.join('、')) + ' 未设置正班主任，该班正班主任通知已跳过；若已设置副班主任，副班主任仍会收到通知。可在「基础数据 → 班级」中补充。</div>';
+      esc(res.missing.join('、')) + ' ' + (o.missingTip || '未设置正班主任，该班通知已跳过。') + '</div>';
+  }
+  if (o.headNote) {
+    body += '<div class="hint-bar" style="margin-bottom:12px">' + icon('bell') + '<span>' + o.headNote + '</span></div>';
   }
 
   body += '<div class="tabs" style="margin-bottom:14px">' +
     '<button class="tab active" data-ntab="img">课表图片（' + imgs.length + '）</button>' +
     '<button class="tab" data-ntab="txt">文字通知（' + res.blocks.length + '）</button></div>';
 
-  body += '<div id="ntImg">' + (imgs.length ? imgs.map((x, i) =>
+  body += '<div id="ntImg">' + (imgs.length ?
+    '<div class="tiny muted" style="margin-bottom:10px">课表固定显示完整一周（五天 × 全部节次），课程卡片只画涉及调整的课程，空白格为正常课表。</div>' +
+    imgs.map((x, i) =>
     '<div class="notice-card"><div class="notice-hd">' + esc(x.im.name) +
     '<span class="pill ' + (isClassRole(x.im.role) ? '' : 'brand') + '">' + x.im.role + '</span>' +
+    (x.opts.tag ? '<span class="pill" style="background:#eef3ff;color:#2f57cc">' + esc(x.opts.tag) + '</span>' : '') +
     (x.im.label ? '<span class="tiny muted">' + esc(x.im.label) + '</span>' : '') +
     '<button class="btn sm" data-dl="' + i + '">' + icon('img') + '下载图片</button></div>' +
     '<div class="notice-img">' + x.svg + '</div></div>').join('')
@@ -7195,10 +7684,9 @@ function openNoticeModal(week, adjId) {
     '</div>';
 
   openModal({
-    title: '调课通知', width: 780,
-    sub: '第 ' + week + ' 周（' + res.range + '）· ' + res.count + ' 处调整，需通知 ' + res.recips + ' 位老师',
+    title: o.title || '调课通知', width: 780, sub: o.sub || '',
     body: body,
-    footer: '<button class="btn" data-close>关闭</button>' +
+    footer: '<button class="btn" data-close>关闭</button>' + (o.footerExtra || '') +
       '<button class="btn" id="ntCopyAll">复制文字</button>' +
       '<button class="btn" id="ntSave">下载文字 .txt</button>' +
       '<button class="btn primary" id="ntSaveAll">下载全部图片</button>',
@@ -7228,12 +7716,12 @@ function openNoticeModal(week, adjId) {
         btn.onclick = () => copyText(res.blocks[+btn.dataset.copy].text);
       });
 
-      r.querySelector('#ntCopyAll').onclick = () => copyText(doc);
+      r.querySelector('#ntCopyAll').onclick = () => copyText(o.doc || '');
 
       r.querySelector('#ntSave').onclick = () => {
         Export.download(
-          new Blob(['\ufeff' + doc], { type: 'text/plain;charset=utf-8' }),
-          safeName('调课通知-第' + week + '周-' + fmtDate(new Date())) + '.txt'
+          new Blob(['\ufeff' + (o.doc || '')], { type: 'text/plain;charset=utf-8' }),
+          o.fileName || safeName('调课通知-' + fmtDate(new Date())) + '.txt'
         );
         toast('文字通知已下载', 'ok');
       };
@@ -7247,10 +7735,48 @@ function openNoticeModal(week, adjId) {
         }
         toast('图片已全部下载', 'ok');
       };
+
+      // 长期调整通知专属：清空记录
+      const clr = r.querySelector('#ntClearPerm');
+      if (clr) clr.onclick = () => { clearPerms(); closeModal(); render(); toast('已清空长期调整记录', 'ok'); };
     }
   });
 }
 
+function openNoticeModal(week, adjId) {
+  const res = buildNotices(week, adjId);
+  if (!res.blocks.length) { toast('本周还没有调课记录，无法生成通知', 'warn'); return; }
+  const tc = res.types || {};
+  const tmix = [tc.move || tc.cross ? '调课' : '', tc.sub ? '代课' : '', tc.cancel ? '停课' : ''].filter(Boolean).join(' / ');
+  showNoticeModal(res, {
+    title: '临时调课通知',
+    week: week,
+    sub: '临时' + (tmix || '调整') + ' · 第 ' + week + ' 周（' + res.range + '）· ' + res.count + ' 处调整，需通知 ' + res.recips + ' 位老师',
+    doc: buildNoticeDoc(res, week),
+    fileName: safeName('临时调课通知-第' + week + '周-' + fmtDate(new Date())) + '.txt',
+    fileTag: '第' + week + '周',
+    missingTip: '未设置正班主任，该班调课通知已跳过（通知只发正班主任一份）。可在「基础数据 → 班级」中补充。'
+  });
+}
+
+/* 长期调整通知：整学期换教师 / 改固定时段，接收人 = 受影响任课教师 + 班级正班主任 */
+function openPermNoticeModal() {
+  const res = buildPermNotices();
+  if (!res.count) { toast('还没有长期调整记录：在课表里拖动课程，或点课程「长期换教师」，会自动记录', 'warn'); return; }
+  if (!res.blocks.length) { toast('长期调整记录里没有需要通知的人', 'warn'); return; }
+  showNoticeModal(res, {
+    title: '长期调课通知',
+    week: UI.week,
+    marks: res.marks,
+    sub: '长期' + (res.summary ? '（' + res.summary + '）' : '') + ' · 整学期生效 · ' + res.count + ' 处长期调整，需通知 ' + res.recips + ' 位老师',
+    doc: buildPermNoticeDoc(res),
+    fileName: safeName('长期调课通知-' + fmtDate(new Date())) + '.txt',
+    fileTag: '长期调整',
+    missingTip: '未设置正班主任，该班长期调整通知已跳过（每班只发正班主任一份）。可在「基础数据 → 班级」中补充。',
+    headNote: '长期调整整学期生效，与「本周调课通知」分开导出；通知完可点「清空长期记录」。',
+    footerExtra: '<button class="btn danger" id="ntClearPerm">清空长期记录</button>'
+  });
+}
 /* ---------------- 数据编辑弹窗 ---------------- */
 function openTaskModal(id) {
   const t = id ? taskOf(id) : null;
@@ -7405,7 +7931,7 @@ function openClassModal(id) {
     '<div class="form-row"><label>班级人数</label><input class="inp" type="number" id="clsSize" value="' + (c ? c.size || 45 : 45) + '"></div>' +
     '<div class="form-row"><label>固定教室</label><input class="inp" id="clsRoom" value="' + esc(c ? c.room || '' : '') + '"></div>' +
     '</div><datalist id="clsTeachers">' + teacherOpts + '</datalist>' +
-    '<div class="tiny muted" style="margin-top:8px">正、副班主任填写教师名单中的姓名时，会自动关联到教师课表；调课通知会同时发给正、副班主任。</div>';
+    '<div class="tiny muted" style="margin-top:8px">正、副班主任填写教师名单中的姓名时，会自动关联到教师课表；调课通知只生成一份发给正班主任，副班主任不再单独通知。</div>';
   openModal({
     title: id ? '编辑班级' : '新增班级', body, width: 560,
     footer: '<button class="btn" data-close>取消</button><button class="btn primary" id="clsSave">保存</button>',
@@ -7862,24 +8388,98 @@ function specTeacher(tid, week, onlyDay) {
   });
 }
 
-/** 全校总课表：按班级分页，每页与单个班级课表同版式 */
-function specMaster(week, onlyDay) {
-  // 每页仍是「XX班课程表」，便于按班分发
-  return DB.S.classes.map((c) => specClass(c.id, week, onlyDay));
-}
-
 function classEntries(cid, week) {
   return entriesForWeek(week).filter((e) => e.lesson.classIds.indexOf(cid) > -1);
 }
 
-async function expClassPNG(cid, week) {
-  const cls = classOf(cid);
-  await Export.pngSheet(specClass(cid, week), safeName(cls.name + '-课表-第' + week + '周') + '.png');
+/* ---------------- 批量导出课表 Excel ----------------
+   班级课表 / 教师课表两页共用：勾选多个对象 → 一个 xlsx，
+   各对象课表纵向排列并在块间插入分页符，打印时一页对应一个班级或一位老师 */
+function ttBatchItems(kind) {
+  const S = DB.S;
+  if (kind === 'class') {
+    return S.classes.map((c) => ({
+      id: c.id, name: c.name, sub: c.head ? '班主任 ' + c.head : '未设班主任'
+    }));
+  }
+  return S.teachers.map((t) => ({
+    id: t.id, name: t.name, sub: (subjectOf(t.subjectId) || {}).name || ''
+  }));
 }
 
-async function expTeacherPNG(tid, week) {
-  const t = teacherOf(tid);
-  await Export.pngSheet(specTeacher(tid, week), safeName(t.name + '-教师课表-第' + week + '周') + '.png');
+function openTTBatchModal(kind) {
+  const isCls = kind === 'class';
+  const items = ttBatchItems(kind);
+  if (!items.length) { toast(isCls ? '还没有班级，无法导出' : '还没有教师，无法导出', 'warn'); return; }
+  const week = UI.week;
+  const noun = isCls ? '班级' : '教师';
+  // 默认勾上当前正在看的那个，避免进弹窗后空选
+  const cur = isCls
+    ? (UI.classId || (DB.S.classes[0] || {}).id || '')
+    : (UI.teacherId || (DB.S.teachers[0] || {}).id || '');
+
+  const body = '<div class="batch-bar">' +
+      '<input class="inp" id="btSearch" placeholder="搜索' + noun + '名称 / 学科">' +
+      '<button type="button" class="btn sm" id="btAll">全选</button>' +
+      '<button type="button" class="btn sm" id="btNone">清空</button>' +
+      '<span class="tiny muted" id="btCount" style="margin-left:auto"></span>' +
+    '</div>' +
+    '<div class="batch-pick" id="btPick">' +
+      items.map((it) => '<label class="check-row" data-name="' + esc(it.name + ' ' + (it.sub || '')) + '">' +
+        '<input type="checkbox" value="' + it.id + '"' + (it.id === cur ? ' checked' : '') + '>' +
+        '<b>' + esc(it.name) + '</b>' + (it.sub ? ' <small>' + esc(it.sub) + '</small>' : '') +
+      '</label>').join('') +
+    '</div>' +
+    '<div class="form-tip">第 ' + week + ' 周（' + weekRangeText(week) + '）· 导出为 1 个 Excel 文件，' +
+      '每' + (isCls ? '个班级' : '位教师') + '的课表各占一页（已插入分页符，打印与转 PDF 自动按页分开）。</div>';
+
+  openModal({
+    title: '批量导出' + noun + '课表',
+    sub: '自由勾选多个' + noun + '，一次导出一份 Excel',
+    width: 700,
+    body: body,
+    footer: '<button class="btn" data-close>取消</button><button class="btn primary" id="btGo">导出 Excel</button>',
+    onMount(root) {
+      const pick = root.querySelector('#btPick');
+      const countEl = root.querySelector('#btCount');
+      const go = root.querySelector('#btGo');
+      const rows = () => Array.from(pick.querySelectorAll('.check-row'));
+      const boxes = () => rows().map((r) => r.querySelector('input'));
+      const sync = () => {
+        const ids = boxes().filter((b) => b.checked).map((b) => b.value);
+        countEl.textContent = '已选 ' + ids.length + ' / ' + boxes().length + ' 个' + noun;
+        go.disabled = !ids.length;
+        go.style.opacity = ids.length ? '' : '.45';
+        return ids;
+      };
+      pick.addEventListener('change', sync);
+      root.querySelector('#btAll').onclick = () => {
+        rows().forEach((r) => { if (!r.classList.contains('off')) r.querySelector('input').checked = true; });
+        sync();
+      };
+      root.querySelector('#btNone').onclick = () => { boxes().forEach((b) => { b.checked = false; }); sync(); };
+      root.querySelector('#btSearch').oninput = (e) => {
+        const q = e.target.value.trim();
+        rows().forEach((r) => r.classList.toggle('off', !!q && r.dataset.name.indexOf(q) < 0));
+      };
+      go.onclick = () => {
+        const ids = sync();
+        if (!ids.length) { toast('请先勾选要导出的' + noun, 'warn'); return; }
+        closeModal();
+        batchExportTTXlsx(kind, ids, week);
+      };
+      sync();
+    }
+  });
+}
+
+function batchExportTTXlsx(kind, ids, week) {
+  const isCls = kind === 'class';
+  const specs = ids.map((id) => (isCls ? specClass(id, week) : specTeacher(id, week)));
+  const file = (isCls ? '班级课表' : '教师课表') + '-第' + week + '周-' + ids.length + (isCls ? '个班' : '位教师');
+  const ok = Export.xlsxSpecsPaged(specs, safeName(file) + '.xlsx',
+    (isCls ? '班级课表' : '教师课表') + ' 第' + week + '周');
+  toast(ok ? '已导出 ' + ids.length + ' 张课表，每页一张' : '导出失败：没有可用的课表', ok ? 'ok' : 'warn');
 }
 
 /* ---------------- 文件选择（WKWebView / Safari 兼容） ----------------
@@ -8325,6 +8925,9 @@ const ACT = {
       openNoticeModal(UI.adjWeek || UI.week);
     }
   },
+  // 长期调整：换任课教师（整学期）+ 导出长期调课通知
+  'perm-teacher': (el) => openPermTeacher(el.dataset.id),
+  'perm-notice': () => openPermNoticeModal(),
 
   'goto-lesson': (el) => {
     const l = lessonOf(el.dataset.id);
@@ -8543,17 +9146,10 @@ const ACT = {
     });
   },
 
-  /* 导出 */
-  'exp-png': (el) => {
-    const t = el.dataset.target;
-    if (t === 'class') expClassPNG(UI.classId || DB.S.classes[0].id, UI.week);
-    else if (t === 'teacher') expTeacherPNG(UI.teacherId || DB.S.teachers[0].id, UI.week);
-    else expMasterPNG(UI.week);
-  },
+  /* 导出（班级 / 教师课表只保留 Excel；全校总课表不提供导出与打印） */
   'exp-xlsx': (el) => {
     const t = el.dataset.target;
     const w = UI.week;
-    const day = UI.mtMode === 'day' ? clamp(UI.mtDay || 0, 0, Math.max(0, DB.S.meta.daysPerWeek - 1)) : null;
     if (t === 'class') {
       const cid = UI.classId || DB.S.classes[0].id;
       Export.xlsxSpec(specClass(cid, w),
@@ -8563,16 +9159,12 @@ const ACT = {
       Export.xlsxSpec(specTeacher(tid, w),
         safeName(teacherOf(tid).name + '-教师课表-第' + w + '周') + '.xlsx');
     } else {
-      Export.xlsxSpecs(specMaster(w, day),
-        safeName('全校总课表-第' + w + '周') + '.xlsx');
+      return;
     }
     toast('Excel 已开始下载', 'ok');
   },
-  'exp-print': (el) => {
-    const t = el.dataset.target;
-    if (t === 'class') printClass(UI.classId || DB.S.classes[0].id, UI.week);
-    else if (t === 'teacher') printTeacher(UI.teacherId || DB.S.teachers[0].id, UI.week);
-    else printMaster(UI.week);
+  'tt-batch': (el) => {
+    openTTBatchModal(el.dataset.kind === 'teacher' ? 'teacher' : 'class');
   },
   'exp-all-class-png': async () => {
     toast('正在生成 ' + DB.S.classes.length + ' 个班级的课表图片…', '');
@@ -8876,17 +9468,6 @@ function printClass(cid, week) {
 function printTeacher(tid, week) {
   Export.printSpecs([specTeacher(tid, week)], ((teacherOf(tid) || {}).name || '教师') + ' 教师课程表');
 }
-function printMaster(week) {
-  const day = UI.mtMode === 'day' ? clamp(UI.mtDay || 0, 0, Math.max(0, DB.S.meta.daysPerWeek - 1)) : null;
-  Export.printSpecs(specMaster(week, day), day == null ? '全校总课表' : '全校总课表 · ' + DAY_FULL[day]);
-}
-
-async function expMasterPNG(week) {
-  const day = UI.mtMode === 'day' ? clamp(UI.mtDay || 0, 0, Math.max(0, DB.S.meta.daysPerWeek - 1)) : null;
-  const name = day == null ? '全校总课表-第' + week + '周' : '全校总课表-第' + week + '周-' + DAY_SHORT[day];
-  await Export.pngSheetMulti(specMaster(week, day), safeName(name) + '.png');
-}
-
 /* ---------------- 设置保存 ---------------- */
 function saveSettings() {
   const S = DB.S;
@@ -9264,8 +9845,12 @@ function applyDropNow(ctx, res) {
   const tName = (subjectOf(t.subjectId) || {}).name || '';
 
   if (week == null) {
+    const lFrom = { day: l.day, slot: l.slot };
+    const tFrom = { day: t.day, slot: t.slot };
     l.day = t.day; l.slot = t.slot;
     t.day = res.cur.day; t.slot = res.cur.slot;
+    recordPermTime(l, lFrom, { day: l.day, slot: l.slot }, '长期对调');
+    recordPermTime(t, tFrom, { day: t.day, slot: t.slot }, '与《' + subjName + '》长期对调');
     dropWeekMoves(l.id, [UI.week]);
     dropWeekMoves(t.id, [UI.week]);
     DB.save();
